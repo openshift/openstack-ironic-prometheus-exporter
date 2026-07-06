@@ -12,6 +12,6 @@
 
 
 def update_instance_uuid(labels):
-    if labels['instance_uuid'] is None and labels['node_uuid']:
-        labels['instance_uuid'] = labels.get('node_uuid')
+    if labels.get('instance_uuid') is None and labels.get('node_uuid'):
+        labels['instance_uuid'] = labels['node_uuid']
     return labels

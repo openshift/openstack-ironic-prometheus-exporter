@@ -203,6 +203,48 @@ class TestPayloadsParser(unittest.TestCase):
         self.assertEqual(
             expected_labels, metrics[expected_metric][0][1])
 
+    def test_missing_instance_uuid_key(self):
+        """Test update_instance_uuid when the key is completely absent."""
+        labels = {'node_uuid': 'test-node-uuid', 'node_name': 'test-node'}
+        valid_labels = ipe_utils.update_instance_uuid(labels)
+        self.assertEqual('test-node-uuid', valid_labels['instance_uuid'])
+
+    def test_category_registry_none_instance_uuid(self):
+        """Test category_registry end-to-end with instance_uuid=None.
+
+        This exercises the full path: _build_labels omits instance_uuid
+        when None, then category_registry calls update_instance_uuid
+        which must handle the missing key.
+        """
+        sample_file2 = os.path.join(
+            os.path.dirname(ironic_prometheus_exporter.__file__),
+            'tests', 'json_samples',
+            'notification-redfish-none-instance_uuid.json')
+        msg2 = json.load(open(sample_file2))
+
+        metrics_registry = CollectorRegistry()
+        redfish.category_registry(msg2['payload'], metrics_registry)
+
+        label = {
+            'node_name': 'knilab-master-u9',
+            'node_uuid': 'c2bd00b9-9881-4179-8b7b-bf786ec3696b',
+            'instance_uuid': 'c2bd00b9-9881-4179-8b7b-bf786ec3696b',
+            'health': 'OK',
+            'maximum_frequency_hz': '63',
+            'maximum_voltage': '250',
+            'minimum_frequency_hz': '47',
+            'minimum_voltage': '185',
+            'output_wattage': '1450',
+            'power_capacity_watts': '1450',
+            'sensor_id': '0:Power@ZZZ-YYY-XXX',
+            'serial_number': 'SN010203040506',
+            'state': 'enabled'
+        }
+
+        sensor_value = metrics_registry.get_sample_value(
+            'baremetal_power_status', label)
+        self.assertEqual(0, sensor_value)
+
     def test_extra_hardware_information(self):
         sample_file = os.path.join(
             os.path.dirname(ironic_prometheus_exporter.__file__),

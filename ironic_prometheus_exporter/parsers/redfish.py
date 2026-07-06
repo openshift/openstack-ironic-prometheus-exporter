@@ -31,20 +31,19 @@ HEALTH_MAP = {
 
 def _build_labels(node_message):
     fields = ['node_name', 'node_uuid', 'instance_uuid']
-    if not node_message['node_name']:
+    if not node_message.get('node_name'):
         fields.remove('node_name')
 
     labels = {}
     extra = node_message.get('payload', {}).get('Extra', {})
 
     for k, v in extra.items():
-        # Renaming uuid to avoid confusion with another labels.
         if k.lower() == 'uuid':
             labels['redfish_system_uuid'] = v
             continue
         labels[k.lower()] = v
 
-    labels.update({k: node_message[k] for k in fields})
+    labels.update({k: node_message[k] for k in fields if k in node_message})
 
     return labels
 

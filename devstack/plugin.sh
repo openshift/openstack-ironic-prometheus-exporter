@@ -31,6 +31,8 @@ function configure_ironic_prometheus_exporter {
     iniset $IRONIC_CONF_FILE oslo_messaging_notifications transport_url fake://
     iniset $IRONIC_CONF_FILE oslo_messaging_notifications location $IRONIC_PROMETHEUS_EXPORTER_LOCATION
 
+    mkdir -p "$IRONIC_PROMETHEUS_EXPORTER_LOCATION"
+
     local gunicorn_ipe_cmd
 
     gunicorn_ipe_cmd=$(which gunicorn)
@@ -66,32 +68,120 @@ function cleanup_ironic_prometheus_exporter {
     $SYSTEMCTL daemon-reload
 }
 
+function log_sensor_data_diagnostics {
+    local node_file="node-0-hardware.redfish.metrics"
+    local stats_file
+    stats_file="$(hostname)-ironic.metrics"
+
+    echo "=== IPE sensor data diagnostics ==="
+    echo "IRONIC_PROMETHEUS_EXPORTER_LOCATION=${IRONIC_PROMETHEUS_EXPORTER_LOCATION}"
+    echo "IRONIC_CONF_FILE=${IRONIC_CONF_FILE}"
+
+    if [[ -f "$IRONIC_CONF_FILE" ]]; then
+        echo "[sensor_data] from ironic.conf:"
+        awk '/^\[sensor_data\]/,/^\[/ {print}' "$IRONIC_CONF_FILE" | head -10
+        echo "[oslo_messaging_notifications] from ironic.conf:"
+        awk '/^\[oslo_messaging_notifications\]/,/^\[/ {print}' "$IRONIC_CONF_FILE" | head -10
+    fi
+
+    if pgrep -af ironic-conductor >/dev/null 2>&1; then
+        echo "ironic-conductor processes:"
+        pgrep -af ironic-conductor || true
+    else
+        echo "WARNING: no ironic-conductor process found"
+    fi
+
+    if [[ -d "$IRONIC_PROMETHEUS_EXPORTER_LOCATION" ]]; then
+        echo "Contents of ${IRONIC_PROMETHEUS_EXPORTER_LOCATION}:"
+        ls -la "$IRONIC_PROMETHEUS_EXPORTER_LOCATION" 2>/dev/null || true
+    else
+        echo "Directory ${IRONIC_PROMETHEUS_EXPORTER_LOCATION} does not exist"
+    fi
+
+    for f in "$node_file" "$stats_file"; do
+        if [[ -f "$IRONIC_PROMETHEUS_EXPORTER_LOCATION/$f" ]]; then
+            echo "Found metrics file: $f"
+        else
+            echo "Missing metrics file: $f"
+        fi
+    done
+
+    if [[ -f "$IPE_ERROR_LF" ]]; then
+        echo "Last lines of ${IPE_ERROR_LF}:"
+        tail -20 "$IPE_ERROR_LF" 2>/dev/null || true
+    fi
+
+    echo "=== end diagnostics ==="
+}
+
 function wait_for_data {
-    # Sleep for more than the [sensor_data]send_sensor_data_interval value
-    # to verify if we can get data from the baremetal
-    # FIXME(iurygregory): Add some logic to verify if the data already exists
-    sleep 240
+    # Wait for sensor data to be collected and written by the exporter.
+    # After a conductor restart, allow time for the periodic scheduler
+    # (sensor_data.interval, default 90s) plus collection latency.
+    local node_file="node-0-hardware.redfish.metrics"
+    local stats_file
+    stats_file="$(hostname)-ironic.metrics"
+    local max_attempts=120
+    local wait_interval=10
+    local attempt=0
+
+    echo "Waiting for $node_file (checking every ${wait_interval}s for up to $((max_attempts * wait_interval))s)..."
+
+    while [ $attempt -lt $max_attempts ]; do
+        if [ -f "$IRONIC_PROMETHEUS_EXPORTER_LOCATION/$node_file" ]; then
+            echo "Found $node_file after $((attempt * wait_interval)) seconds"
+            return 0
+        fi
+
+        if [ -f "$IRONIC_PROMETHEUS_EXPORTER_LOCATION/$stats_file" ]; then
+            echo "Found conductor metrics $stats_file (still waiting for $node_file)"
+        fi
+
+        attempt=$((attempt + 1))
+        if [ $((attempt % 6)) -eq 0 ]; then
+            echo "Still waiting (${attempt}/${max_attempts})..."
+            if [ -d "$IRONIC_PROMETHEUS_EXPORTER_LOCATION" ]; then
+                ls -la "$IRONIC_PROMETHEUS_EXPORTER_LOCATION" 2>/dev/null || true
+            fi
+        fi
+        sleep $wait_interval
+    done
+
+    echo "WARNING: $node_file not found after $((max_attempts * wait_interval)) seconds"
+    log_sensor_data_diagnostics
+    return 1
 }
 
 function check_data {
     local node_file="node-0-hardware.redfish.metrics"
-    if [ -f "$IRONIC_PROMETHEUS_EXPORTER_LOCATION/$node_file" ]; then
-        echo "Found $node_file in $IRONIC_PROMETHEUS_EXPORTER_LOCATION"
-        if curl -s --head  --request  GET "http://$SERVICE_HOST:$IRONIC_PROMETHEUS_EXPORTER_PORT/metrics" | grep "200 OK" > /dev/null; then
-            echo "Data successfully retrieved from ironic-prometheus-exporter application"
-        else
-            die $LINENO "Couldn't get data from ironic-prometheus-exporter application"
-        fi
-    else
+    if [ ! -f "$IRONIC_PROMETHEUS_EXPORTER_LOCATION/$node_file" ]; then
         die $LINENO "Couldn't find $node_file in $IRONIC_PROMETHEUS_EXPORTER_LOCATION"
     fi
+    echo "Found $node_file in $IRONIC_PROMETHEUS_EXPORTER_LOCATION"
+
+    local stats_file
     stats_file="$(hostname)-ironic.metrics"
-    if [ -f "$IRONIC_PROMETHEUS_EXPORTER_LOCATION/$stats_file" ]; then
-        echo "#### Metrics data ####"
-        curl "http://$SERVICE_HOST:$IRONIC_PROMETHEUS_EXPORTER_PORT/metrics"
-    else
+    if [ ! -f "$IRONIC_PROMETHEUS_EXPORTER_LOCATION/$stats_file" ]; then
         die $LINENO "Could not find $stats_file in $IRONIC_PROMETHEUS_EXPORTER_LOCATION"
     fi
+
+    local url="http://$SERVICE_HOST:$IRONIC_PROMETHEUS_EXPORTER_PORT/metrics"
+    local attempt=0
+    local max_attempts=12
+
+    echo "Waiting for exporter to become ready at $url ..."
+    while [ $attempt -lt $max_attempts ]; do
+        if curl -s --head --request GET "$url" | grep "200 OK" > /dev/null; then
+            echo "Data successfully retrieved from ironic-prometheus-exporter application"
+            echo "#### Metrics data ####"
+            curl "$url"
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 5
+    done
+
+    die $LINENO "Couldn't get data from ironic-prometheus-exporter application after $((max_attempts * 5))s"
 }
 
 echo_summary "ironic-prometheus-exporter devstack plugin.sh called: $1/$2"

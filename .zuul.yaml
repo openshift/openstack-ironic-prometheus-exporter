@@ -65,7 +65,7 @@
         q-metering: true
         ovn-controller: false
         ovn-northd: false
-        q-ovn-metadata-agent: false
+        q-ovn-agent: false
         q-svc: true
         c-api: False
         c-bak: False

@@ -12,6 +12,7 @@
 
 import logging
 import os
+import re
 
 from oslo_config import cfg
 from oslo_messaging.notify import notifier
@@ -27,6 +28,33 @@ from ironic_prometheus_exporter.parsers import redfish
 LOG = logging.getLogger(__name__)
 
 
+# Event type emitted by ironic for conductor-level metrics. See
+# ConductorManager._sensors_conductor() in ironic.
+CONDUCTOR_EVENT_TYPE = 'ironic.metrics'
+
+# Event type emitted by ironic for node sensor data. Ironic builds this as
+# 'hardware.{node.driver}.metrics', so the middle segment is the node's
+# hardware type and can be any value registered in the deployment (ipmi,
+# redfish, idrac, ilo, irmc, snmp, or a third party hardware type). See
+# ConductorManager._sensors_nodes_task() in ironic.
+NODE_EVENT_TYPE_RE = re.compile(r'^hardware\..+\.metrics$')
+
+
+def is_metrics_notification(event_type):
+    """Return True if the notification carries metrics we should export.
+
+    The driver is registered as an oslo.messaging notification driver and
+    therefore receives every notification ironic emits, including versioned
+    notifications such as NodeSetPowerStatePayload. Those carry a versioned
+    object payload that this exporter cannot parse and must not attempt to
+    write out.
+    """
+    if not event_type:
+        return False
+    return (event_type == CONDUCTOR_EVENT_TYPE
+            or bool(NODE_EVENT_TYPE_RE.match(event_type)))
+
+
 prometheus_opts = [
     cfg.StrOpt('location', required=True,
                help='Directory where the files will be written.')
@@ -40,6 +68,15 @@ def register_opts(conf):
 class PrometheusFileDriver(notifier.Driver):
     """Publish notifications into a File to be used by Prometheus"""
 
+    # Node metrics event types that have a dedicated sensor parser. Node
+    # notifications for any other hardware type still produce the header
+    # timestamp metric so operators can tell the node is reporting.
+    NODE_PARSERS = {
+        'hardware.ipmi.metrics': ipmi.category_registry,
+        'hardware.redfish.metrics': redfish.category_registry,
+        'hardware.idrac.metrics': redfish.category_registry,
+    }
+
     def __init__(self, conf, topics, transport):
         self.location = conf.oslo_messaging_notifications.location
         if not os.path.exists(self.location):
@@ -47,11 +84,18 @@ class PrometheusFileDriver(notifier.Driver):
         super(PrometheusFileDriver, self).__init__(conf, topics, transport)
 
     def notify(self, ctxt, message, priority, retry):
+        event_type = message.get('event_type')
+        if not is_metrics_notification(event_type):
+            # Not a metrics notification, ignore it instead of trying to
+            # parse a payload we do not understand.
+            LOG.debug("Ignoring non-metrics notification event_type: %s",
+                      event_type)
+            return
+
         try:
             registry = CollectorRegistry()
-            event_type = message['event_type']
             payload = message['payload']
-            if event_type == 'ironic.metrics':
+            if event_type == CONDUCTOR_EVENT_TYPE:
                 # We know this message payload is from a conductor itself
                 # and not for node drivers.
                 header.timestamp_conductor_registry(payload, registry)
@@ -59,14 +103,12 @@ class PrometheusFileDriver(notifier.Driver):
 
             else:
                 header.timestamp_registry(payload, registry)
-                if event_type == 'hardware.ipmi.metrics':
-                    ipmi.category_registry(payload, registry)
-
-                elif event_type == 'hardware.redfish.metrics':
-                    redfish.category_registry(payload, registry)
-
-                elif event_type == 'hardware.idrac.metrics':
-                    redfish.category_registry(payload, registry)
+                parser = self.NODE_PARSERS.get(event_type)
+                if parser is not None:
+                    parser(payload, registry)
+                else:
+                    LOG.debug("No sensor parser for event_type %s, only the "
+                              "timestamp metric will be exported.", event_type)
 
             # Order of preference is for a node Name, UUID, or
             # payload hostname field to be used (i.e. for conductor
@@ -76,6 +118,15 @@ class PrometheusFileDriver(notifier.Driver):
                 payload.get('node_uuid') or
                 payload.get('hostname')
             )
+            if not field:
+                # Without an identifier we cannot build a stable filename,
+                # so skip writing rather than crashing.
+                LOG.warning(
+                    "Skipping notification '%s': payload is missing a "
+                    "node_name, node_uuid, and hostname identifier.",
+                    event_type)
+                return
+
             statFile = os.path.join(
                 self.location, field + '-' + event_type)
 

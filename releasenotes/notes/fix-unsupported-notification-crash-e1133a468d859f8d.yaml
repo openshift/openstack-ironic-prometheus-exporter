@@ -1,0 +1,20 @@
+---
+fixes:
+  - |
+    Fixed a crash (``TypeError: unsupported operand type(s) for +: 'NoneType'
+    and 'str'``) in ``PrometheusFileDriver`` when Ironic emitted versioned
+    notifications such as ``NodeSetPowerStatePayload``. The driver is
+    registered as an oslo.messaging notification driver and therefore
+    receives every notification Ironic emits, not only sensor data. Versioned
+    notifications carry a versioned object payload with no ``node_name``,
+    ``node_uuid``, or ``hostname`` field, which made the driver fail while
+    building the output file name.
+
+    The driver now only processes metrics notifications, meaning the
+    conductor metrics event type (``ironic.metrics``) and node sensor data
+    event types (``hardware.<hardware type>.metrics``, which Ironic builds
+    from the node's hardware type). All other notifications are ignored.
+    Node sensor notifications for hardware types without a dedicated parser
+    continue to export the ``baremetal_last_payload_timestamp_seconds``
+    metric as before. See `bug 2166070
+    <https://bugs.launchpad.net/ironic-prometheus-exporter/+bug/2166070>`_.

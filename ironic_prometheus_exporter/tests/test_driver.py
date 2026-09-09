@@ -145,3 +145,108 @@ class TestPrometheusFileNotifier(test_utils.BaseTestCase):
         self.assertIn(node1 + '-hardware.ipmi.metrics', all_files)
         self.assertIn(node2 + '-hardware.redfish.metrics', all_files)
         self.assertIn(node3 + '-hardware.idrac.metrics', all_files)
+
+    def test_unsupported_versioned_notification_ignored(self):
+        # Regression test for bug 2166070: versioned Ironic notifications
+        # such as NodeSetPowerStatePayload must be ignored rather than
+        # crashing the notifier with a TypeError.
+        temp_dir = self.useFixture(fixtures.TempDir()).path
+        self.config(location=temp_dir,
+                    group='oslo_messaging_notifications')
+        transport = oslo_messaging.get_notification_transport(self.conf)
+        driver = PrometheusFileDriver(self.conf, None, transport)
+
+        msg = {
+            'event_type': 'baremetal.node.power_set.end',
+            'payload': {
+                'ironic_object.name': 'NodeSetPowerStatePayload',
+                'ironic_object.namespace': 'ironic',
+                'ironic_object.version': '1.17',
+                'ironic_object.data': {
+                    'to_power': 'power off',
+                    'uuid': 'bea07dae-6f5c-49e8-b331-c7d40bd9b863',
+                    'name': 'hostname',
+                    'power_state': 'power off',
+                },
+            },
+        }
+
+        # Should not raise.
+        driver.notify(None, msg, 'info', 0)
+
+        DIR = self.conf.oslo_messaging_notifications.location
+        all_files = [name for name in os.listdir(DIR)
+                     if os.path.isfile(os.path.join(DIR, name))]
+        self.assertEqual(len(all_files), 0)
+
+    def test_missing_event_type_ignored(self):
+        temp_dir = self.useFixture(fixtures.TempDir()).path
+        self.config(location=temp_dir,
+                    group='oslo_messaging_notifications')
+        transport = oslo_messaging.get_notification_transport(self.conf)
+        driver = PrometheusFileDriver(self.conf, None, transport)
+
+        # Should not raise even without an event_type key.
+        driver.notify(None, {'payload': {}}, 'info', 0)
+
+        DIR = self.conf.oslo_messaging_notifications.location
+        all_files = [name for name in os.listdir(DIR)
+                     if os.path.isfile(os.path.join(DIR, name))]
+        self.assertEqual(len(all_files), 0)
+
+    def test_unparsed_hardware_type_still_exports_timestamp(self):
+        # Ironic emits 'hardware.{node.driver}.metrics', so the hardware
+        # type can be any registered driver. Hardware types without a
+        # dedicated sensor parser must still export the header timestamp
+        # metric rather than being dropped.
+        temp_dir = self.useFixture(fixtures.TempDir()).path
+        self.config(location=temp_dir,
+                    group='oslo_messaging_notifications')
+        transport = oslo_messaging.get_notification_transport(self.conf)
+        driver = PrometheusFileDriver(self.conf, None, transport)
+
+        sample_file = os.path.join(
+            os.path.dirname(ironic_prometheus_exporter.__file__),
+            'tests', 'json_samples', 'notification-ipmi-1.json')
+        msg = json.load(open(sample_file))
+        msg['event_type'] = 'hardware.ilo.metrics'
+        node = msg['payload']['node_name']
+
+        driver.notify(None, msg, 'info', 0)
+
+        DIR = self.conf.oslo_messaging_notifications.location
+        all_files = [name for name in os.listdir(DIR)
+                     if os.path.isfile(os.path.join(DIR, name))]
+        self.assertEqual(len(all_files), 1)
+        self.assertIn(node + '-hardware.ilo.metrics', all_files)
+
+        with open(os.path.join(DIR, node + '-hardware.ilo.metrics')) as f:
+            contents = f.read()
+        self.assertIn('baremetal_last_payload_timestamp_seconds', contents)
+
+    def test_conductor_metrics_notification(self):
+        temp_dir = self.useFixture(fixtures.TempDir()).path
+        self.config(location=temp_dir,
+                    group='oslo_messaging_notifications')
+        transport = oslo_messaging.get_notification_transport(self.conf)
+        driver = PrometheusFileDriver(self.conf, None, transport)
+
+        sample_file = os.path.join(
+            os.path.dirname(ironic_prometheus_exporter.__file__),
+            'tests', 'json_samples', 'notification-ironic.json')
+        msg = json.load(open(sample_file))
+        # Ironic publishes the conductor notification under 'ironic.metrics'
+        # (the '.update' suffix is only used inside the payload), and the
+        # conductor message only carries a hostname - no node identifiers.
+        msg['event_type'] = 'ironic.metrics'
+        msg['payload'].pop('node_uuid', None)
+        msg['payload'].pop('instance_uuid', None)
+        hostname = msg['payload']['hostname']
+
+        driver.notify(None, msg, 'info', 0)
+
+        DIR = self.conf.oslo_messaging_notifications.location
+        all_files = [name for name in os.listdir(DIR)
+                     if os.path.isfile(os.path.join(DIR, name))]
+        self.assertEqual(len(all_files), 1)
+        self.assertIn(hostname + '-ironic.metrics', all_files)
